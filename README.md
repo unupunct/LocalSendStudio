@@ -54,10 +54,6 @@ npm run tauri build
 
 The installer will be in `src-tauri/target/release/bundle/`.
 
-## Screenshot
-
-![Dashboard](screenshots/dashboard.png)
-
 ## Usage
 
 1. Open the app on each device on the same LAN.
