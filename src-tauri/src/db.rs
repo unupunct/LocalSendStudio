@@ -35,14 +35,20 @@ pub struct DeviceGroup {
     pub device_ids: String, // comma separated
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedDevice {
+    pub id: String,
+    pub name: String,
+    pub added: i64,
+}
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
 
 impl Db {
-    pub fn open() -> anyhow::Result<Self> {
-        let dir = util::app_data_dir();
-        std::fs::create_dir_all(&dir)?;
+    pub fn open(dir: &std::path::Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(dir)?;
         let path = dir.join("localsend.db");
         let conn = Connection::open(path)?;
         conn.execute_batch(
@@ -76,11 +82,10 @@ impl Db {
                 name TEXT NOT NULL,
                 device_ids TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS download_rules (
+            CREATE TABLE IF NOT EXISTS trusted_devices (
                 id TEXT PRIMARY KEY,
-                source_device TEXT NOT NULL,
-                ext TEXT NOT NULL,
-                dest TEXT NOT NULL
+                name TEXT NOT NULL,
+                added INTEGER NOT NULL
             );"
         )?;
         Ok(Self { conn: Mutex::new(conn) })
@@ -134,6 +139,33 @@ impl Db {
             id: r.get(0)?, filename: r.get(1)?, source: r.get(2)?, destination: r.get(3)?,
             size: r.get(4)?, started: r.get(5)?, ended: r.get(6)?, speed: r.get(7)?, status: r.get(8)?, direction: r.get(9)?,
         })).unwrap();
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    pub fn clear_transfers(&self) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("DELETE FROM transfer_history", []);
+    }
+
+    pub fn is_trusted(&self, id: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT 1 FROM trusted_devices WHERE id=?1", params![id], |_| Ok(())).is_ok()
+    }
+    pub fn trust(&self, id: &str, name: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO trusted_devices(id,name,added) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET name=?2",
+            params![id, name, util::now_ms()],
+        );
+    }
+    pub fn untrust(&self, id: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("DELETE FROM trusted_devices WHERE id=?1", params![id]);
+    }
+    pub fn list_trusted(&self) -> Vec<TrustedDevice> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id,name,added FROM trusted_devices ORDER BY added DESC").unwrap();
+        let rows = stmt.query_map([], |r| Ok(TrustedDevice { id: r.get(0)?, name: r.get(1)?, added: r.get(2)? })).unwrap();
         rows.filter_map(|r| r.ok()).collect()
     }
 

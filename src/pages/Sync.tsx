@@ -1,68 +1,61 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { ArrowDown, ArrowUp, FolderSync, Play } from "lucide-react";
+import { useApp } from "../lib/store";
 import { api } from "../lib/api";
-import { open } from "@tauri-apps/plugin-dialog";
+import { pickFolder } from "../lib/pick";
+import { Page } from "../components/ui";
 
 export default function Sync() {
-  const [devices, setDevices] = useState<any[]>([]);
-  const [device, setDevice] = useState<any>(null);
+  const { devices, toast, fail } = useApp();
+  const online = devices.filter((d) => d.status === "online" && d.shared_folders.length);
+  const [devId, setDevId] = useState("");
   const [share, setShare] = useState("");
-  const [direction, setDirection] = useState<"up" | "down">("up");
-  const [localPath, setLocalPath] = useState("");
-  const [remoteBase, setRemoteBase] = useState("");
-  const [status, setStatus] = useState("");
-
-  useEffect(() => { (async () => setDevices(await api.devices()))(); }, []);
-
-  const pickLocal = async () => {
-    const d = await open({ directory: true, multiple: false });
-    if (d) setLocalPath(d as string);
-  };
+  const [dir, setDir] = useState<"up" | "down">("down");
+  const [local, setLocal] = useState("");
+  const [remote, setRemote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState("");
+  const dev = online.find((d) => d.id === devId);
 
   const run = async () => {
-    if (!device || !share || !localPath) { setStatus("Missing inputs"); return; }
-    setStatus("Syncing...");
+    if (!dev || !share || !local) return;
+    setBusy(true);
+    setResult("");
     try {
-      if (direction === "up") {
-        await api.syncLocalToRemote(localPath, device.ip, device.port, share, remoteBase);
-      } else {
-        await api.syncRemoteToLocal(device.ip, device.port, share, remoteBase, localPath);
-      }
-      setStatus("Sync complete");
-    } catch (e) { setStatus("Failed: " + String(e)); }
+      const r = dir === "up" ? await api.syncUp(local, dev, share, remote) : await api.syncDown(dev, share, remote, local);
+      setResult(`${r.copied} file${r.copied === 1 ? "" : "s"} copied, ${r.skipped} already up to date.`);
+      toast("Sync finished", "ok");
+    } catch (e) { fail(e); } finally { setBusy(false); }
   };
 
   return (
-    <div>
-      <h1>Synchronization</h1>
-      <div className="card">
-        <h2>Manual Sync</h2>
+    <Page title="Sync" sub="Copy a folder to or from another device. Files that already match are skipped, and nothing is ever deleted.">
+      <div className="card stack">
+        <div className="grid two">
+          <label><div className="muted small">Device</div>
+            <select className="input" value={devId} onChange={(e) => { setDevId(e.target.value); setShare(online.find((d) => d.id === e.target.value)?.shared_folders[0] ?? ""); }}>
+              <option value="">Choose a device…</option>
+              {online.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+            </select></label>
+          <label><div className="muted small">Shared folder</div>
+            <select className="input" value={share} onChange={(e) => setShare(e.target.value)} disabled={!dev}>
+              {dev?.shared_folders.map((s) => <option key={s}>{s}</option>)}
+            </select></label>
+        </div>
+        <div className="perm" style={{ alignSelf: "flex-start" }}>
+          <button className={dir === "down" ? "on" : ""} onClick={() => setDir("down")}><ArrowDown size={14} style={{ verticalAlign: -2 }} /> Download to this device</button>
+          <button className={dir === "up" ? "on" : ""} onClick={() => setDir("up")}><ArrowUp size={14} style={{ verticalAlign: -2 }} /> Upload from this device</button>
+        </div>
         <div className="row">
-          <select className="input" onChange={e => setDevice(devices.find(d => d.id === e.target.value))}>
-            <option value="">Select device</option>
-            {devices.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
-          </select>
-          {device && (
-            <select className="input" value={share} onChange={e => setShare(e.target.value)}>
-              <option value="">Select share</option>
-              {device.shared_folders.map((s: string) => <option key={s} value={s}>{s}</option>)}
-            </select>
-          )}
-          <select className="input" value={direction} onChange={e => setDirection(e.target.value as any)}>
-            <option value="up">Local → Remote</option>
-            <option value="down">Remote → Local</option>
-          </select>
+          <input className="input grow" placeholder="Folder on this device" value={local} onChange={(e) => setLocal(e.target.value)} />
+          <button className="btn" onClick={async () => { const p = await pickFolder(); if (p) setLocal(p); }}>Choose…</button>
         </div>
-        <div className="row" style={{ marginTop: 8 }}>
-          <input className="input" style={{ flex: 1 }} value={localPath} onChange={e => setLocalPath(e.target.value)} placeholder="Local folder path" />
-          <button className="btn secondary" onClick={pickLocal}>Browse</button>
+        <input className="input" placeholder="Subfolder on the other device (optional)" value={remote} onChange={(e) => setRemote(e.target.value)} />
+        <div className="row">
+          <button className="btn primary" disabled={busy || !dev || !share || !local} onClick={run}><Play size={16} /> {busy ? "Syncing…" : "Start sync"}</button>
+          {result && <span className="pill ok"><FolderSync size={13} /> {result}</span>}
         </div>
-        <div className="row" style={{ marginTop: 8 }}>
-          <input className="input" style={{ flex: 1 }} value={remoteBase} onChange={e => setRemoteBase(e.target.value)} placeholder="Remote base path (optional)" />
-        </div>
-        <button className="btn" style={{ marginTop: 12 }} onClick={run}>Run Sync</button>
-        {status && <div className="muted" style={{ marginTop: 8 }}>{status}</div>}
-        <div className="muted" style={{ marginTop: 8 }}>Note: two-way automatic sync and conflict detection are planned; this performs a one-way copy.</div>
       </div>
-    </div>
+    </Page>
   );
 }

@@ -1,8 +1,20 @@
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn app_data_dir() -> PathBuf {
     dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("LocalSendStudio")
+}
+
+/// Where received files go by default.
+pub fn default_download_dir() -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        let base = std::env::var("EXTERNAL_STORAGE").unwrap_or_else(|_| "/storage/emulated/0".into());
+        return PathBuf::from(base).join("Download").join("LocalSendStudio");
+    }
+    #[cfg(not(target_os = "android"))]
+    dirs::download_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("LocalSendStudio")
 }
@@ -11,132 +23,240 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-pub fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
-    use sha2::{Digest, Sha256};
+pub fn new_hasher() -> sha2::Sha256 {
+    use sha2::Digest;
+    sha2::Sha256::new()
+}
+
+pub fn hex(bytes: impl AsRef<[u8]>) -> String {
+    bytes.as_ref().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+pub fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    use sha2::Digest;
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
+    let mut hasher = new_hasher();
+    let mut buf = vec![0u8; 256 * 1024];
     loop {
         let n = f.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex(hasher.finalize()))
 }
 
-pub fn safe_join(root: &std::path::Path, rel: &str) -> Option<PathBuf> {
+const RESERVED: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1",
+    "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// A single file or folder name: no separators, no traversal, nothing Windows treats specially.
+pub fn valid_name(part: &str) -> bool {
+    if part.is_empty() || part == "." || part == ".." || part.len() > 255 {
+        return false;
+    }
+    if part
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*'))
+    {
+        return false;
+    }
+    if part.ends_with('.') || part.ends_with(' ') {
+        return false;
+    }
+    let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+    !RESERVED.contains(&stem.as_str())
+}
+
+/// Resolve a client-supplied relative path inside `root`.
+/// Rejects traversal, absolute paths, Windows drive/ADS tricks and symlinks that leave the root.
+pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     let rel = rel.replace('\\', "/");
-    let rel = rel.trim_start_matches('/');
     let mut out = root.to_path_buf();
     for part in rel.split('/') {
-        if part.is_empty() || part == "." { continue; }
-        if part == ".." { return None; }
-        out = out.join(part);
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if !valid_name(part) {
+            return None;
+        }
+        out.push(part);
     }
-    // ensure within root
+    // Symlink escape: canonicalize the deepest existing ancestor and require it to stay inside root.
     let canon_root = root.canonicalize().ok()?;
-    // target may not exist; check lexical containment
-    if !out.starts_with(root) { return None; }
-    let _ = canon_root;
-    Some(out)
-}
-
-pub fn local_ip() -> String {
-    // try connecting to a public IP to get local addr (no data sent)
-    if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        let _ = s.connect("8.8.8.8:80");
-        if let Ok(a) = s.local_addr() { return a.ip().to_string(); }
+    let mut probe = out.as_path();
+    loop {
+        if let Ok(c) = probe.canonicalize() {
+            return if c.starts_with(&canon_root) { Some(out) } else { None };
+        }
+        probe = probe.parent()?;
     }
-    "127.0.0.1".into()
 }
 
+/// `name (1).ext`, `name (2).ext` ... until a free name is found.
+pub fn unique_path(target: &Path) -> PathBuf {
+    if !target.exists() {
+        return target.to_path_buf();
+    }
+    let stem = target.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = target.extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_default();
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    for i in 1..10_000 {
+        let c = dir.join(format!("{} ({}){}", stem, i, ext));
+        if !c.exists() {
+            return c;
+        }
+    }
+    target.to_path_buf()
+}
+
+/// (name, ip, kind) for each usable IPv4 interface.
 pub fn list_interfaces() -> Vec<(String, String, String)> {
-    // name, ip, kind
     let mut out = Vec::new();
-    // Windows: parse ipconfig
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(o) = std::process::Command::new("ipconfig").output() {
-            let txt = String::from_utf8_lossy(&o.stdout);
-            let mut current = String::from("Adapter");
-            for line in txt.lines() {
-                let t = line.trim();
-                if t.ends_with(':') && !t.contains(" ") == false {
-                    // adapter header lines like "Ethernet adapter ...:"
+    if let Ok(list) = if_addrs::get_if_addrs() {
+        for i in list {
+            if i.is_loopback() {
+                continue;
+            }
+            if let if_addrs::IfAddr::V4(v4) = &i.addr {
+                if v4.ip.is_link_local() {
+                    continue;
                 }
-                if line.contains("adapter") {
-                    current = line.trim().trim_end_matches(':').to_string();
-                }
-                if t.starts_with("IPv4 Address") || t.starts_with("IPv4") {
-                    if let Some(ip) = t.split(':').nth(1) {
-                        let ip = ip.trim().trim_matches('.').trim().to_string();
-                        let ip = ip.replace("(Preferred)", "").trim().to_string();
-                        if !ip.is_empty() {
-                            let kind = if current.to_lowercase().contains("wi-fi") || current.to_lowercase().contains("wireless") { "wifi" } else { "ethernet" };
-                            out.push((current.clone(), ip, kind.to_string()));
-                        }
-                    }
-                }
+                let n = i.name.to_lowercase();
+                let kind = if n.contains("wi-fi") || n.contains("wlan") || n.starts_with("wl") || n.contains("wireless") {
+                    "wifi"
+                } else if n.contains("vethernet")
+                    || n.contains("docker")
+                    || n.starts_with("veth")
+                    || n.contains("vmware")
+                    || n.contains("virtualbox")
+                    || n.starts_with("br-")
+                    || n.contains("tailscale")
+                    || n.contains("vpn")
+                    || n.starts_with("tun")
+                {
+                    "virtual"
+                } else {
+                    "ethernet"
+                };
+                out.push((i.name.clone(), v4.ip.to_string(), kind.to_string()));
             }
         }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // parse ip addr / ifconfig
-        if let Ok(o) = std::process::Command::new("ip").args(["-o","addr"]).output() {
-            let txt = String::from_utf8_lossy(&o.stdout);
-            for line in txt.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 {
-                    let name = parts[1].to_string();
-                    let ip = parts[3].split('/').next().unwrap_or("").to_string();
-                    if ip.contains('.') && !ip.starts_with("127.") {
-                        let kind = if name.starts_with("wl") || name.starts_with("wlan") { "wifi" } else { "ethernet" };
-                        out.push((name, ip, kind.to_string()));
-                    }
-                }
-            }
-        }
-    }
-    if out.is_empty() {
-        out.push(("Default".into(), local_ip(), "ethernet".into()));
     }
     out
 }
 
+
 pub fn hostname() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(o) = std::process::Command::new("hostname").output() {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !s.is_empty() { return s; }
+    for var in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(s) = std::env::var(var) {
+            if !s.trim().is_empty() {
+                return s.trim().to_string();
+            }
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
         if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
-            let s = s.trim().to_string();
-            if !s.is_empty() { return s; }
+            if !s.trim().is_empty() {
+                return s.trim().to_string();
+            }
         }
         if let Ok(o) = std::process::Command::new("hostname").output() {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !s.is_empty() { return s; }
+            if !s.is_empty() {
+                return s;
+            }
         }
     }
-    "LocalSendStudio-PC".into()
+    if cfg!(target_os = "android") {
+        if let Ok(o) = std::process::Command::new("getprop").arg("ro.product.model").output() {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+        "Android device".into()
+    } else {
+        "LocalSendStudio device".into()
+    }
 }
 
 pub fn os_name() -> String {
-    if cfg!(target_os = "windows") { "Windows".into() }
-    else if cfg!(target_os = "macos") { "macOS".into() }
-    else if cfg!(target_os = "linux") { "Linux".into() }
-    else if cfg!(target_os = "android") { "Android".into() }
-    else if cfg!(target_os = "ios") { "iOS".into() }
-    else { "Unknown".into() }
+    if cfg!(target_os = "windows") {
+        "Windows".into()
+    } else if cfg!(target_os = "macos") {
+        "macOS".into()
+    } else if cfg!(target_os = "android") {
+        "Android".into()
+    } else if cfg!(target_os = "linux") {
+        "Linux".into()
+    } else if cfg!(target_os = "ios") {
+        "iOS".into()
+    } else {
+        "Unknown".into()
+    }
 }
 
-#[allow(dead_code)]
-pub fn socket_addr(s: &str) -> Option<SocketAddr> {
-    s.parse().ok()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("sub")).unwrap();
+        std::fs::write(d.path().join("sub/a.txt"), "x").unwrap();
+        d
+    }
+
+    #[test]
+    fn allows_normal_paths() {
+        let d = root();
+        assert!(safe_join(d.path(), "").is_some());
+        assert!(safe_join(d.path(), "sub/a.txt").is_some());
+        assert!(safe_join(d.path(), "/sub//a.txt").is_some());
+        assert!(safe_join(d.path(), "new/file.bin").is_some());
+    }
+
+    #[test]
+    fn rejects_traversal_and_tricks() {
+        let d = root();
+        for bad in [
+            "..", "../x", "sub/../../x", "sub\\..\\..\\x", "C:\\Windows", "C:evil", "a.txt:stream", "CON", "nul.txt",
+            "x/aux", "trailing.", "bad|name", "q?",
+        ] {
+            assert!(safe_join(d.path(), bad).is_none(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn valid_name_rules() {
+        assert!(valid_name("report v2.pdf"));
+        assert!(valid_name("файл.txt"));
+        assert!(!valid_name("../x"));
+        assert!(!valid_name("a/b"));
+        assert!(!valid_name(""));
+    }
+
+    #[test]
+    fn unique_path_adds_counter() {
+        let d = root();
+        let p = d.path().join("sub/a.txt");
+        assert_eq!(unique_path(&p), d.path().join("sub/a (1).txt"));
+        assert_eq!(unique_path(&d.path().join("sub/none.txt")), d.path().join("sub/none.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape() {
+        let d = root();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.path(), d.path().join("link")).unwrap();
+        assert!(safe_join(d.path(), "link/secret").is_none());
+        assert!(safe_join(d.path(), "link").is_none());
+    }
 }

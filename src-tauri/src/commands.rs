@@ -1,39 +1,155 @@
-use crate::client;
-use crate::db::SharedFolder;
-use crate::discovery;
-use crate::protocol::DEFAULT_PORT;
+use crate::db::{DeviceGroup, SharedFolder, TransferRecord, TrustedDevice};
+use crate::protocol::Peer;
 use crate::state::{AppState, DiscoveredDevice};
-use crate::transfer::{CancelMap, new_cancel_map};
-use crate::util;
-use serde_json::json;
-use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager, State};
+use crate::transfer::{self, CancelMap, Job, Kind};
+use crate::{auth, client, discovery, util};
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use tauri::State;
+
+type R<T> = Result<T, String>;
+
+fn me(state: &AppState) -> Peer {
+    Peer { id: state.identity.id.clone(), name: state.device_name() }
+}
+
+fn s<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
+
+fn join_remote(dir: &str, name: &str) -> String {
+    let dir = dir.trim_matches('/');
+    if dir.is_empty() { name.to_string() } else { format!("{}/{}", dir, name) }
+}
+
+// ---- identity & settings -------------------------------------------------
 
 #[tauri::command]
-pub fn get_identity(state: State<AppState>) -> serde_json::Value {
+pub fn get_identity(state: State<AppState>) -> Value {
     json!({
         "id": state.identity.id,
-        "name": state.identity.name,
+        "name": state.device_name(),
         "os": state.identity.os,
-        "version": state.identity.version,
+        "version": crate::state::VERSION,
+        "port": state.port(),
+        "trust_mode": state.trust_mode(),
     })
 }
 
 #[tauri::command]
-pub fn set_device_name(state: State<AppState>, name: String) {
-    // mutate identity (Arc) by saving new file; update in-memory not trivial due Arc. We'll just save; restart needed. For simplicity store setting.
+pub fn set_device_name(state: State<AppState>, name: String) -> R<()> {
+    let name: String = name.trim().chars().take(60).collect();
+    if name.is_empty() {
+        return Err("Name cannot be empty".into());
+    }
     state.db.set_setting("device_name", &name);
+    *state.name.write() = name;
+    Ok(())
 }
+
+#[tauri::command]
+pub fn get_settings(state: State<AppState>, key: String) -> Option<String> {
+    state.db.get_setting(&key)
+}
+
+#[tauri::command]
+pub fn set_settings(state: State<AppState>, key: String, value: String) {
+    state.db.set_setting(&key, &value);
+    // The Inbox always follows the download folder.
+    if key == "download_dir" && Path::new(&value).is_dir() {
+        let mut sf = state.shared_folders.lock();
+        if let Some(f) = sf.iter_mut().find(|f| f.name == "Inbox") {
+            f.path = value.clone();
+            state.db.upsert_shared_folder(f);
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_download_dir(state: State<AppState>) -> String {
+    state
+        .db
+        .get_setting("download_dir")
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| util::default_download_dir().to_string_lossy().to_string())
+}
+
+// ---- devices ---------------------------------------------------------------
 
 #[tauri::command]
 pub fn get_devices(state: State<AppState>) -> Vec<DiscoveredDevice> {
-    state.devices.lock().values().cloned().collect()
+    let now = util::now_ms();
+    let manual = discovery::manual_targets(&state);
+    let mut map = state.devices.lock();
+    map.retain(|_, d| {
+        now - d.last_seen < discovery::FORGET_AFTER_MS || manual.iter().any(|m| m.starts_with(&format!("{}:", d.ip)))
+    });
+    let mut out: Vec<DiscoveredDevice> = map
+        .values()
+        .cloned()
+        .map(|mut d| {
+            d.status = if now - d.last_seen < discovery::ONLINE_WINDOW_MS { "online" } else { "offline" }.into();
+            d.trusted = state.db.is_trusted(&d.id);
+            d
+        })
+        .collect();
+    out.sort_by(|a, b| (a.status != "online").cmp(&(b.status != "online")).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    out
 }
 
 #[tauri::command]
-pub fn get_interfaces() -> Vec<serde_json::Value> {
+pub async fn add_device_by_ip(state: State<'_, AppState>, host: String) -> R<DiscoveredDevice> {
+    let host = host.trim().to_string();
+    let (h, port) = match host.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse::<u16>().unwrap()),
+        _ => (host.clone(), crate::protocol::DEFAULT_PORT),
+    };
+    if h.is_empty() || h.len() > 255 {
+        return Err("Enter an IP address, for example 192.168.1.20".into());
+    }
+    let dev = discovery::probe(&state, &h, port).await.map_err(|e| format!("Could not reach {}:{} - {}", h, port, e))?;
+    let mut list = discovery::manual_targets(&state);
+    let key = format!("{}:{}", h, port);
+    if !list.contains(&key) {
+        list.push(key);
+        state.db.set_setting("manual_devices", &serde_json::to_string(&list).unwrap());
+    }
+    Ok(dev)
+}
+
+#[tauri::command]
+pub fn forget_device(state: State<AppState>, id: String) {
+    let ip = state.devices.lock().remove(&id).map(|d| d.ip);
+    if let Some(ip) = ip {
+        let list: Vec<String> = discovery::manual_targets(&state).into_iter().filter(|m| !m.starts_with(&format!("{}:", ip))).collect();
+        state.db.set_setting("manual_devices", &serde_json::to_string(&list).unwrap());
+    }
+}
+
+#[tauri::command]
+pub fn get_interfaces() -> Vec<Value> {
     util::list_interfaces().into_iter().map(|(n, ip, k)| json!({"name": n, "ip": ip, "kind": k})).collect()
 }
+
+// ---- trust -------------------------------------------------------------------
+
+#[tauri::command]
+pub fn respond_approval(state: State<AppState>, id: String, allow: bool, remember: bool) {
+    auth::resolve(&state, &id, allow, remember);
+}
+
+#[tauri::command]
+pub fn list_trusted(state: State<AppState>) -> Vec<TrustedDevice> {
+    state.db.list_trusted()
+}
+
+#[tauri::command]
+pub fn untrust_device(state: State<AppState>, id: String) {
+    state.db.untrust(&id);
+    state.session_allowed.lock().remove(&id);
+}
+
+// ---- shared folders ----------------------------------------------------------
 
 #[tauri::command]
 pub fn get_shared_folders(state: State<AppState>) -> Vec<SharedFolder> {
@@ -41,21 +157,33 @@ pub fn get_shared_folders(state: State<AppState>) -> Vec<SharedFolder> {
 }
 
 #[tauri::command]
-pub fn add_shared_folder(state: State<AppState>, path: String, name: Option<String>) -> SharedFolder {
-    let id = uuid::Uuid::new_v4().to_string();
-    let nm = name.unwrap_or_else(|| std::path::Path::new(&path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Shared".into()));
-    let f = SharedFolder { id: id.clone(), name: nm, path, enabled: true, read: true, upload: true, manage: true };
-    state.db.upsert_shared_folder(&f);
+pub fn add_shared_folder(state: State<AppState>, path: String, name: Option<String>) -> R<SharedFolder> {
+    if !Path::new(&path).is_dir() {
+        return Err("That folder does not exist".into());
+    }
+    let base = name
+        .filter(|n| util::valid_name(n))
+        .or_else(|| Path::new(&path).file_name().map(|s| s.to_string_lossy().to_string()).filter(|n| util::valid_name(n)))
+        .unwrap_or_else(|| "Shared".into());
     let mut sf = state.shared_folders.lock();
+    // Shares are addressed by name, so names must be unique.
+    let mut nm = base.clone();
+    let mut i = 2;
+    while sf.iter().any(|f| f.name == nm) {
+        nm = format!("{} ({})", base, i);
+        i += 1;
+    }
+    // Safe defaults: others can look and download, not change anything.
+    let f = SharedFolder { id: uuid::Uuid::new_v4().to_string(), name: nm, path, enabled: true, read: true, upload: false, manage: false };
+    state.db.upsert_shared_folder(&f);
     sf.push(f.clone());
-    f
+    Ok(f)
 }
 
 #[tauri::command]
 pub fn remove_shared_folder(state: State<AppState>, id: String) {
     state.db.delete_shared_folder(&id);
-    let mut sf = state.shared_folders.lock();
-    sf.retain(|f| f.id != id);
+    state.shared_folders.lock().retain(|f| f.id != id);
 }
 
 #[tauri::command]
@@ -71,133 +199,133 @@ pub fn toggle_shared_folder(state: State<AppState>, id: String, enabled: bool) {
 pub fn set_folder_perms(state: State<AppState>, id: String, read: bool, upload: bool, manage: bool) {
     let mut sf = state.shared_folders.lock();
     if let Some(f) = sf.iter_mut().find(|f| f.id == id) {
-        f.read = read; f.upload = upload; f.manage = manage;
+        f.read = read;
+        f.upload = upload;
+        f.manage = manage;
         state.db.upsert_shared_folder(f);
     }
 }
 
+// ---- remote browsing -----------------------------------------------------------
+
 #[tauri::command]
-pub async fn list_remote_dir(state: State<'_, AppState>, ip: String, port: u16, share: String, path: String) -> Result<serde_json::Value, String> {
-    client::list_dir(&ip, port, &share, &path).await.map_err(|e| e.to_string())
+pub async fn list_remote_dir(state: State<'_, AppState>, ip: String, port: u16, share: String, path: String) -> R<Value> {
+    client::list_dir(&me(&state), &ip, port, &share, &path).await.map_err(s)
 }
 
 #[tauri::command]
-pub async fn remote_info(ip: String, port: u16) -> Result<serde_json::Value, String> {
-    client::info(&ip, port).await.map_err(|e| e.to_string())
+pub async fn remote_info(ip: String, port: u16) -> R<Value> {
+    client::info(&ip, port).await.map_err(s)
 }
 
 #[tauri::command]
-pub async fn make_remote_dir(ip: String, port: u16, share: String, path: String) -> Result<(), String> {
-    client::mkdir(&ip, port, &share, &path).await.map_err(|e| e.to_string())
+pub async fn make_remote_dir(state: State<'_, AppState>, ip: String, port: u16, share: String, path: String) -> R<()> {
+    client::mkdir(&me(&state), &ip, port, &share, &path).await.map_err(s)
 }
 
 #[tauri::command]
-pub async fn delete_remote_path(ip: String, port: u16, share: String, path: String) -> Result<(), String> {
-    client::delete(&ip, port, &share, &path).await.map_err(|e| e.to_string())
+pub async fn delete_remote_path(state: State<'_, AppState>, ip: String, port: u16, share: String, path: String) -> R<()> {
+    client::delete(&me(&state), &ip, port, &share, &path).await.map_err(s)
 }
 
 #[tauri::command]
-pub async fn rename_remote_path(ip: String, port: u16, share: String, path: String, new_name: String) -> Result<(), String> {
-    client::rename(&ip, port, &share, &path, &new_name).await.map_err(|e| e.to_string())
+pub async fn rename_remote_path(state: State<'_, AppState>, ip: String, port: u16, share: String, path: String, new_name: String) -> R<()> {
+    client::rename(&me(&state), &ip, port, &share, &path, &new_name).await.map_err(s)
 }
 
-#[tauri::command]
-pub async fn upload_to_remote(ip: String, port: u16, share: String, remote_path: String, local_path: String) -> Result<(), String> {
-    client::upload(&ip, port, &share, &remote_path, std::path::Path::new(&local_path)).await.map_err(|e| e.to_string())
-}
+// ---- transfers -------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn download_from_remote(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    cancel: State<'_, CancelMap>,
+#[allow(clippy::too_many_arguments)]
+pub fn start_download(
+    state: State<AppState>,
+    cancels: State<CancelMap>,
     ip: String,
     port: u16,
     share: String,
     remote_path: String,
-    local_path: String,
-    transfer_id: String,
     filename: String,
-    source_device: String,
-) -> Result<(), String> {
-    let cancel_map = cancel.inner().clone();
-    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    cancel_map.lock().insert(transfer_id.clone(), flag.clone());
-    let app2 = app.clone();
-    let tid = transfer_id.clone();
-    let ip2 = ip.clone();
-    let state2 = state.inner().clone();
-    let filename2 = filename.clone();
-    tokio::spawn(async move {
-        let start = chrono::Utc::now().timestamp_millis();
-        let mut last = start;
-        let mut last_bytes = 0u64;
-        let mut speed = 0f64;
-        let local = std::path::PathBuf::from(&local_path);
-        let res = client::download(&ip2, port, &share, &remote_path, &local, Some(flag.clone()), |done, total| {
-            let now = chrono::Utc::now().timestamp_millis();
-            if now - last >= 500 {
-                speed = (done - last_bytes) as f64 / ((now - last) as f64 / 1000.0);
-                last = now;
-                last_bytes = done;
-            }
-            let _ = app2.emit("transfer-progress", json!({
-                "id": tid, "transferred": done, "total": total, "speed": speed, "status": "transferring"
-            }));
-            // check cancel
-        }).await;
-        let cancelled = cancel_map.lock().get(&tid).map(|f| f.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false);
-        let status = if cancelled { "cancelled" } else if res.is_ok() { "completed" } else { "failed" };
-        let ended = chrono::Utc::now().timestamp_millis();
-        let size = std::fs::metadata(&local_path).map(|m| m.len() as i64).unwrap_or(0);
-        let rec = crate::db::TransferRecord {
-            id: tid.clone(),
-            filename: filename2,
-            source: source_device,
-            destination: state2.identity.name.clone(),
-            size,
-            started: start,
-            ended: Some(ended),
-            speed,
-            status: status.into(),
-            direction: "download".into(),
-        };
-        state2.db.insert_transfer(&rec);
-        let _ = app2.emit("transfer-done", json!({"id": tid, "status": status}));
-    });
-    Ok(())
+    device_name: String,
+    local_dir: Option<String>,
+) -> R<String> {
+    if !util::valid_name(&filename) {
+        return Err("Invalid file name".into());
+    }
+    let dir = local_dir
+        .filter(|d| !d.is_empty())
+        .or_else(|| state.db.get_setting("download_dir").filter(|d| !d.is_empty()))
+        .map(PathBuf::from)
+        .unwrap_or_else(util::default_download_dir);
+    let id = uuid::Uuid::new_v4().to_string();
+    transfer::spawn(
+        state.inner().clone(),
+        cancels.inner().clone(),
+        Job { id: id.clone(), ip, port, share, device_name, filename, kind: Kind::Download { remote_path, local_dir: dir } },
+    );
+    Ok(id)
 }
 
 #[tauri::command]
-pub fn cancel_transfer(cancel: State<'_, CancelMap>, id: String) {
-    if let Some(f) = cancel.lock().get(&id).cloned() {
+#[allow(clippy::too_many_arguments)]
+pub fn start_upload(
+    state: State<AppState>,
+    cancels: State<CancelMap>,
+    ip: String,
+    port: u16,
+    share: String,
+    remote_dir: String,
+    local_path: String,
+    device_name: String,
+) -> R<String> {
+    let lp = PathBuf::from(&local_path);
+    if !lp.is_file() {
+        return Err("Pick a file to send".into());
+    }
+    let filename = lp.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let id = uuid::Uuid::new_v4().to_string();
+    transfer::spawn(
+        state.inner().clone(),
+        cancels.inner().clone(),
+        Job {
+            id: id.clone(),
+            ip,
+            port,
+            share,
+            device_name,
+            filename: filename.clone(),
+            kind: Kind::Upload { remote_path: join_remote(&remote_dir, &filename), local_path: lp },
+        },
+    );
+    Ok(id)
+}
+
+#[tauri::command]
+pub fn cancel_transfer(cancels: State<CancelMap>, id: String) {
+    if let Some(f) = cancels.lock().get(&id).cloned() {
         f.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 #[tauri::command]
-pub fn get_transfer_history(state: State<AppState>) -> Vec<crate::db::TransferRecord> {
+pub fn get_transfer_history(state: State<AppState>) -> Vec<TransferRecord> {
     state.db.list_transfers()
 }
 
 #[tauri::command]
-pub fn get_settings(state: State<AppState>, key: String) -> Option<String> {
-    state.db.get_setting(&key)
+pub fn clear_transfer_history(state: State<AppState>) {
+    state.db.clear_transfers();
 }
 
-#[tauri::command]
-pub fn set_settings(state: State<AppState>, key: String, value: String) {
-    state.db.set_setting(&key, &value);
-}
+// ---- groups ----------------------------------------------------------------------
 
 #[tauri::command]
-pub fn get_groups(state: State<AppState>) -> Vec<crate::db::DeviceGroup> {
+pub fn get_groups(state: State<AppState>) -> Vec<DeviceGroup> {
     state.db.list_groups()
 }
 
 #[tauri::command]
-pub fn add_group(state: State<AppState>, name: String, device_ids: String) -> crate::db::DeviceGroup {
-    let g = crate::db::DeviceGroup { id: uuid::Uuid::new_v4().to_string(), name, device_ids };
+pub fn add_group(state: State<AppState>, name: String, device_ids: String) -> DeviceGroup {
+    let g = DeviceGroup { id: uuid::Uuid::new_v4().to_string(), name, device_ids };
     state.db.upsert_group(&g);
     g
 }
@@ -207,73 +335,156 @@ pub fn delete_group(state: State<AppState>, id: String) {
     state.db.delete_group(&id);
 }
 
+// ---- diagnostics -----------------------------------------------------------------
+
 #[tauri::command]
-pub async fn network_diagnostics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    // basic checks
-    let devices = state.devices.lock().len();
-    let port_ok = std::net::TcpListener::bind(format!("0.0.0.0:{}", DEFAULT_PORT)).is_ok();
-    // re-bind? We already bound in server; binding again fails. So check via connect to self.
-    let self_reach = client::info("127.0.0.1", DEFAULT_PORT).await.is_ok();
+pub async fn network_diagnostics(state: State<'_, AppState>) -> R<Value> {
+    let port = state.port();
+    let self_reach = client::info("127.0.0.1", port).await.is_ok();
+    let now = util::now_ms();
+    let online = state.devices.lock().values().filter(|d| now - d.last_seen < discovery::ONLINE_WINDOW_MS).count();
+    let interfaces: Vec<Value> = util::list_interfaces().into_iter().map(|(n, ip, k)| json!({"name": n, "ip": ip, "kind": k})).collect();
+    let usable = interfaces.iter().filter(|i| i["kind"] != "virtual").count();
     Ok(json!({
-        "discovery": if devices >= 0 { "Working" } else { "Unknown" },
-        "devices_found": devices,
-        "local_port": DEFAULT_PORT,
+        "port": port,
         "self_reachable": self_reach,
-        "interfaces": util::list_interfaces(),
+        "devices_online": online,
+        "interfaces": interfaces,
+        "usable_interfaces": usable,
         "shared_folders": state.shared_folders.lock().len(),
+        "trust_mode": state.trust_mode(),
+        "discovery_port": crate::protocol::DISCOVERY_PORT,
     }))
 }
 
 #[tauri::command]
-pub async fn speed_test(ip: String, port: u16) -> Result<serde_json::Value, String> {
-    // send/receive a temp 4MB? We'll just measure info roundtrip latency and a small download if possible.
-    let start = std::time::Instant::now();
-    let _ = client::info(&ip, port).await.map_err(|e| e.to_string())?;
-    let rtt = start.elapsed().as_millis();
-    Ok(json!({"rtt_ms": rtt, "note": "Application-level round trip"}))
+pub async fn speed_test(state: State<'_, AppState>, ip: String, port: u16) -> R<Value> {
+    let (bps, rtt) = client::speedtest(&me(&state), &ip, port, 32 << 20).await.map_err(s)?;
+    Ok(json!({ "bytes_per_sec": bps, "rtt_ms": rtt }))
 }
 
 #[tauri::command]
-pub async fn sync_local_to_remote(local_path: String, ip: String, port: u16, share: String, remote_base: String) -> Result<(), String> {
-    use walkdir::WalkDir;
-    for entry in WalkDir::new(&local_path).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_file() {
-            let rel = entry.path().strip_prefix(&local_path).unwrap().to_string_lossy().replace('\\', "/");
-            let remote_path = if remote_base.is_empty() { rel.clone() } else { format!("{}/{}", remote_base, rel) };
-            client::upload(&ip, port, &share, &remote_path, entry.path()).await.map_err(|e| e.to_string())?;
+pub fn get_local_storage(state: State<AppState>) -> Value {
+    use fs4::available_space;
+    let dir = PathBuf::from(get_download_dir(state));
+    let probe = if dir.exists() { dir } else { dir.ancestors().find(|p| p.exists()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")) };
+    json!({
+        "path": probe.to_string_lossy(),
+        "available": available_space(&probe).unwrap_or(0),
+        "total": fs4::total_space(&probe).unwrap_or(0),
+    })
+}
+
+// ---- one-way sync ------------------------------------------------------------------
+
+fn walk_remote<'a>(
+    me: &'a Peer,
+    ip: &'a str,
+    port: u16,
+    share: &'a str,
+    dir: String,
+    out: &'a mut Vec<(String, u64)>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let data = client::list_dir(me, ip, port, share, &dir).await?;
+        for e in data.get("entries").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+            let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let path = join_remote(&dir, name);
+            if e.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false) {
+                walk_remote(me, ip, port, share, path, out).await?;
+            } else {
+                out.push((path, e.get("size").and_then(|v| v.as_u64()).unwrap_or(0)));
+            }
         }
+        Ok(())
+    })
+}
+
+/// Copy files missing on the remote (same name + size = skipped). Never deletes anything.
+#[tauri::command]
+pub async fn sync_local_to_remote(state: State<'_, AppState>, local_path: String, ip: String, port: u16, share: String, remote_base: String) -> R<Value> {
+    let me = me(&state);
+    let mut remote = Vec::new();
+    if client::list_dir(&me, &ip, port, &share, &remote_base).await.is_ok() {
+        walk_remote(&me, &ip, port, &share, remote_base.trim_matches('/').to_string(), &mut remote).await.map_err(s)?;
     }
-    Ok(())
+    let have: std::collections::HashMap<String, u64> = remote.into_iter().collect();
+    let (mut copied, mut skipped) = (0u32, 0u32);
+    for entry in walkdir::WalkDir::new(&local_path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()) {
+        let rel = entry.path().strip_prefix(&local_path).map_err(s)?.to_string_lossy().replace('\\', "/");
+        let remote_path = join_remote(&remote_base, &rel);
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if have.get(&remote_path) == Some(&size) {
+            skipped += 1;
+            continue;
+        }
+        client::upload(&me, &ip, port, &share, &remote_path, entry.path(), None, |_, _| {}).await.map_err(s)?;
+        copied += 1;
+    }
+    Ok(json!({ "copied": copied, "skipped": skipped }))
 }
 
 #[tauri::command]
-pub async fn sync_remote_to_local(ip: String, port: u16, share: String, remote_path: String, local_base: String) -> Result<(), String> {
-    // list dir recursively via repeated list; simple top-level only
-    let data = client::list_dir(&ip, port, &share, &remote_path).await.map_err(|e| e.to_string())?;
-    let entries = data.get("entries").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let base = std::path::PathBuf::from(&local_base);
-    let _ = std::fs::create_dir_all(&base);
-    for e in entries {
-        let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        if e.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let sub = base.join(name);
-            let _ = std::fs::create_dir_all(&sub);
+pub async fn sync_remote_to_local(state: State<'_, AppState>, ip: String, port: u16, share: String, remote_path: String, local_base: String) -> R<Value> {
+    let me = me(&state);
+    let mut files = Vec::new();
+    let base = remote_path.trim_matches('/').to_string();
+    walk_remote(&me, &ip, port, &share, base.clone(), &mut files).await.map_err(s)?;
+    let (mut copied, mut skipped) = (0u32, 0u32);
+    for (path, size) in files {
+        let rel = path.strip_prefix(&base).unwrap_or(&path).trim_start_matches('/').to_string();
+        let mut local = PathBuf::from(&local_base);
+        for part in rel.split('/') {
+            if !util::valid_name(part) {
+                local = PathBuf::new();
+                break;
+            }
+            local.push(part);
+        }
+        if local.as_os_str().is_empty() {
+            continue;
+        }
+        if std::fs::metadata(&local).map(|m| m.len() == size).unwrap_or(false) {
+            skipped += 1;
+            continue;
+        }
+        client::download(&me, &ip, port, &share, &path, &local, None, |_, _| {}).await.map_err(s)?;
+        copied += 1;
+    }
+    Ok(json!({ "copied": copied, "skipped": skipped }))
+}
+
+// ---- local file picking (used where the OS dialog cannot return real paths, i.e. Android) ----
+
+#[tauri::command]
+pub fn list_local_dir(path: String) -> R<Value> {
+    // Roots are platform specific; an empty path means "start here".
+    let dir = if path.is_empty() {
+        if cfg!(target_os = "android") {
+            PathBuf::from(std::env::var("EXTERNAL_STORAGE").unwrap_or_else(|_| "/storage/emulated/0".into()))
         } else {
-            let rp = if remote_path.is_empty() { name.to_string() } else { format!("{}/{}", remote_path, name) };
-            let lp = base.join(name);
-            client::download(&ip, port, &share, &rp, &lp, None, |_d, _t| {}).await.map_err(|e| e.to_string())?;
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
         }
+    } else {
+        PathBuf::from(&path)
+    };
+    let rd = std::fs::read_dir(&dir).map_err(|e| format!("Cannot open {}: {}", dir.display(), e))?;
+    let mut entries: Vec<Value> = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(md) = std::fs::metadata(e.path()) else { continue };
+        entries.push(json!({ "name": name, "is_dir": md.is_dir(), "size": md.len() }));
     }
-    Ok(())
-}
-
-#[tauri::command]
-pub fn get_local_shared_storage(state: State<AppState>) -> serde_json::Value {
-    // disk space for first shared folder or home
-    let mut total = 0u64; let mut avail = 0u64;
-    #[cfg(target_os = "windows")]
-    {
-        // use wmic? simpler: fs2 not available. Use std not enough. Return placeholder via sys? We'll try GetDiskFreeSpaceEx via cmd.
-    }
-    json!({"total": total, "available": avail})
+    entries.sort_by(|a, b| {
+        let (ad, bd) = (a["is_dir"].as_bool().unwrap_or(false), b["is_dir"].as_bool().unwrap_or(false));
+        bd.cmp(&ad).then_with(|| a["name"].as_str().unwrap_or("").to_lowercase().cmp(&b["name"].as_str().unwrap_or("").to_lowercase()))
+    });
+    Ok(json!({
+        "path": dir.to_string_lossy(),
+        "parent": dir.parent().map(|p| p.to_string_lossy().to_string()),
+        "entries": entries,
+    }))
 }

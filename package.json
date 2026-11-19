@@ -1,6 +1,6 @@
 {
   "name": "localsendstudio",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Universal local network file sharing, synchronization and device management",
   "private": true,
   "type": "module",
@@ -19,7 +19,6 @@
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "react-router-dom": "^6.30.0",
-    "recharts": "2.15.0",
     "lucide-react": "^0.454.0"
   },
   "devDependencies": {
